@@ -2675,9 +2675,15 @@ static int mov_read_vdep(MOVContext* c, AVIOContext* pb, MOVAtom atom)
     if (!tag)
         return AVERROR(ENOMEM);
 
-    int ret = mov_add_tref_id(tag, avio_rb32(pb));
-    if (ret < 0)
-        return ret;
+    /* Two distinct targets suffice to reject an ambiguous DV association. */
+    for (int64_t i = 0; i < atom.size / 4 && tag->nb_id < 2; i++) {
+        uint32_t id = avio_rb32(pb);
+        if (avio_feof(pb))
+            return AVERROR_INVALIDDATA;
+        int ret = mov_add_tref_id(tag, id);
+        if (ret < 0)
+            return ret;
+    }
 
     return 0;
 }
@@ -11149,7 +11155,7 @@ static int mov_parse_dovi_streams(AVFormatContext *s)
         const AVPacketSideData *sd;
         const AVDOVIDecoderConfigurationRecord *dovi;
 
-        if (st->codecpar->codec_id != AV_CODEC_ID_HEVC || !tag)
+        if (st->codecpar->codec_id != AV_CODEC_ID_HEVC || !tag || tag->nb_id != 1)
             continue;
 
         if (st->codecpar->codec_tag != MKTAG('d','v','h','e') &&
