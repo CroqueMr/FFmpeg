@@ -11137,6 +11137,7 @@ static int mov_parse_lcevc_streams(AVFormatContext *s)
 static int mov_parse_dovi_streams(AVFormatContext *s)
 {
     int err;
+    unsigned reported = 0;
 
     if (s->nb_streams <= 1)
         return 0;
@@ -11155,7 +11156,30 @@ static int mov_parse_dovi_streams(AVFormatContext *s)
         const AVPacketSideData *sd;
         const AVDOVIDecoderConfigurationRecord *dovi;
 
-        if (st->codecpar->codec_id != AV_CODEC_ID_HEVC || !tag || tag->nb_id != 1)
+        if (st->codecpar->codec_id != AV_CODEC_ID_HEVC)
+            continue;
+
+        sd = av_packet_side_data_get(st->codecpar->coded_side_data,
+                                     st->codecpar->nb_coded_side_data,
+                                     AV_PKT_DATA_DOVI_CONF);
+        if (sd && sd->size >= sizeof(*dovi)) {
+            const AVDOVIDecoderConfigurationRecord *config = (const void *)sd->data;
+            if (config->dv_profile == 7 && config->rpu_present_flag &&
+                config->el_present_flag && !config->bl_present_flag && reported++ < 16) {
+                const char *reason = !tag ? "no-vdep" : tag->nb_id != 1 ? "ambiguous-vdep" :
+                    st->codecpar->codec_tag != MKTAG('d','v','h','e') &&
+                    st->codecpar->codec_tag != MKTAG('d','v','h','1') &&
+                    st->codecpar->codec_tag != MKTAG('h','v','c','1') &&
+                    st->codecpar->codec_tag != MKTAG('h','e','v','1') ?
+                    "unsupported-sample-entry" : "declared";
+                av_log(s, AV_LOG_INFO, "DV MOV association: el_index=%d el_track=%d codec_tag=0x%08x "
+                       "vdep_count=%d target0=%u target1=%u reason=%s\n", st->index, st->id,
+                       st->codecpar->codec_tag, tag ? tag->nb_id : 0,
+                       tag && tag->nb_id ? tag->id[0] : 0,
+                       tag && tag->nb_id > 1 ? tag->id[1] : 0, reason);
+            }
+        }
+        if (!tag || tag->nb_id != 1)
             continue;
 
         if (st->codecpar->codec_tag != MKTAG('d','v','h','e') &&
@@ -11164,9 +11188,6 @@ static int mov_parse_dovi_streams(AVFormatContext *s)
             st->codecpar->codec_tag != MKTAG('h','e','v','1'))
             continue;
 
-        sd = av_packet_side_data_get(st->codecpar->coded_side_data,
-                                     st->codecpar->nb_coded_side_data,
-                                     AV_PKT_DATA_DOVI_CONF);
         if (!sd)
             continue;
         dovi = (const AVDOVIDecoderConfigurationRecord *)sd->data;
@@ -11180,7 +11201,8 @@ static int mov_parse_dovi_streams(AVFormatContext *s)
         st_base = mov_find_reference_track(s, st, tag->id, tag->nb_id, 0);
         if (!st_base) {
             int loglevel = (s->error_recognition & AV_EF_EXPLODE) ? AV_LOG_ERROR : AV_LOG_WARNING;
-            av_log(s, loglevel, "Failed to find base layer for Dolby Vision EL stream\n");
+            av_log(s, loglevel, "DV MOV association rejected: el_track=%d target=%u reason=missing-base\n",
+                   st->id, tag->id[0]);
             if (s->error_recognition & AV_EF_EXPLODE)
                 return AVERROR_INVALIDDATA;
             continue;
