@@ -3392,8 +3392,6 @@ static int matroska_parse_dovi_streams(AVFormatContext *s, const AVPacket *pkt)
     }
 
     if (!source_config || !el_st || !bl_st ||
-        el_st->codecpar->width > bl_st->codecpar->width ||
-        el_st->codecpar->height > bl_st->codecpar->height ||
         el_st->codecpar->extradata_size < 23 || el_st->codecpar->extradata[0] != 1)
         return 0;
 
@@ -3407,12 +3405,25 @@ static int matroska_parse_dovi_streams(AVFormatContext *s, const AVPacket *pkt)
         remaining -= length_size;
         if (size < 2 || size > remaining || (data[0] & 0x80) || !(data[1] & 7))
             return 0;
+        if ((data[0] >> 1) == 63) /* Already joined BL+EL, not an independent layer. */
+            return 0;
         has_vcl |= (data[0] >> 1) < 32;
         has_rpu |= (data[0] >> 1) == 62;
         data += size;
         remaining -= size;
     }
     if (remaining || !has_rpu || !has_vcl)
+        return 0;
+
+    /* RPU can be carried by the larger BL, not just by the EL. */
+    if (el_st->codecpar->width >= bl_st->codecpar->width &&
+        el_st->codecpar->height >= bl_st->codecpar->height &&
+        (el_st->codecpar->width > bl_st->codecpar->width ||
+         el_st->codecpar->height > bl_st->codecpar->height))
+        FFSWAP(AVStream *, bl_st, el_st);
+    if (el_st->codecpar->width > bl_st->codecpar->width ||
+        el_st->codecpar->height > bl_st->codecpar->height ||
+        el_st->codecpar->extradata_size < 23 || el_st->codecpar->extradata[0] != 1)
         return 0;
 
     if (!av_packet_side_data_get(el_st->codecpar->coded_side_data,
@@ -4571,8 +4582,27 @@ static int matroska_read_seek(AVFormatContext *s, int stream_index,
         tracks[i].end_timecode         = 0;
     }
 
+    /* A common Dolby layer key may start in an earlier cluster than the
+     * selected track's key. Retain both; the existing timestamp gate still
+     * excludes packets before the requested random-access point. */
+    int64_t seek_pos = sti->index_entries[index].pos;
+    for (unsigned j = 0; j < s->nb_stream_groups; j++) {
+        const AVStreamGroup *group = s->stream_groups[j];
+        if (group->type != AV_STREAM_GROUP_PARAMS_DOLBY_VISION || group->nb_streams != 2)
+            continue;
+        AVStream *peer = group->streams[0] == st ? group->streams[1] :
+                         group->streams[1] == st ? group->streams[0] : NULL;
+        if (!peer)
+            continue;
+        int64_t key = sti->index_entries[index].timestamp;
+        const AVIndexEntry *entry = avformat_index_get_entry_from_timestamp(peer,
+            av_rescale_q(key, st->time_base, peer->time_base), flags);
+        if (entry && (entry->flags & AVINDEX_KEYFRAME) &&
+            !av_compare_ts(entry->timestamp, peer->time_base, key, st->time_base))
+            seek_pos = FFMIN(seek_pos, entry->pos);
+    }
     /* We seek to a level 1 element, so set the appropriate status. */
-    matroska_reset_status(matroska, 0, sti->index_entries[index].pos);
+    matroska_reset_status(matroska, 0, seek_pos);
     if (flags & AVSEEK_FLAG_ANY) {
         sti->skip_to_keyframe = 0;
         matroska->skip_to_timecode = timestamp;
