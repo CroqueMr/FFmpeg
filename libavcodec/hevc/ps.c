@@ -1726,9 +1726,9 @@ static void hevc_sps_free(AVRefStructOpaque opaque, void *obj)
     av_freep(&sps->data);
 }
 
-static int compare_sps(const HEVCSPS *sps1, const HEVCSPS *sps2)
+int ff_hevc_sps_equal(const HEVCSPS *sps1, const HEVCSPS *sps2)
 {
-    return sps1->data_size == sps2->data_size &&
+    return sps1->vps == sps2->vps && sps1->data_size == sps2->data_size &&
            !memcmp(sps1->data, sps2->data, sps1->data_size);
 }
 
@@ -1772,7 +1772,7 @@ int ff_hevc_decode_nal_sps(GetBitContext *gb, AVCodecContext *avctx,
      * original one.
      * otherwise drop all PPSes that depend on it */
     if (ps->sps_list[sps_id] &&
-        compare_sps(ps->sps_list[sps_id], sps)) {
+        ff_hevc_sps_equal(ps->sps_list[sps_id], sps)) {
         av_refstruct_unref(&sps);
     } else {
         remove_sps(ps, sps_id);
