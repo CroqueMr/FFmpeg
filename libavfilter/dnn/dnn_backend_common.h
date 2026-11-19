@@ -25,7 +25,6 @@
 #define AVFILTER_DNN_DNN_BACKEND_COMMON_H
 
 #include "queue.h"
-#include "safe_queue.h"
 #include "../dnn_interface.h"
 #include "libavutil/thread.h"
 
@@ -112,16 +111,6 @@ int ff_dnn_fill_task(TaskItem *task, DNNExecBaseParams *exec_params, void *backe
  * @returns 0 if successful or error code otherwise.
  */
 int ff_dnn_async_module_cleanup(DNNAsyncExecModule *async_module);
-
-/**
- * Wait for all inference requests to complete before teardown.
- * This blocks the calling thread until all request items have been
- * returned to the request_queue by the async inference threads.
- *
- * @param request_queue pointer to the SafeQueue holding request items
- * @param nireq total number of allocated request items
- */
-void ff_dnn_wait_requests(SafeQueue *request_queue, int nireq);
 
 /**
  * Start asynchronous inference routine for the TensorFlow
