@@ -3214,6 +3214,12 @@ static int hevc_frame_start(HEVCContext *s, HEVCLayerContext *l,
     }
 
     av_refstruct_replace(&s->pps, pps);
+    // Headers can replace an SPS and restore it before a picture uses it.
+    // Preserve the active base decoder when the effective SPS is identical.
+    if (l == &s->layers[0] && l->sps && l->sps != sps &&
+        s->vps == sps->vps && ff_hevc_sps_equal(l->sps, sps))
+        av_refstruct_replace(&l->sps, sps);
+
     if (l->sps != sps) {
         const HEVCSPS *sps_base = s->layers[0].sps;
         enum AVPixelFormat pix_fmt = sps->pix_fmt;

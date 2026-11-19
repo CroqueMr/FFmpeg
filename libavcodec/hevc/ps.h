@@ -524,6 +524,8 @@ int ff_hevc_parse_sps(HEVCSPS *sps, GetBitContext *gb, unsigned int *sps_id,
                       unsigned nuh_layer_id, int apply_defdispwin,
                       const HEVCVPS * const *vps_list, AVCodecContext *avctx);
 
+int ff_hevc_sps_equal(const HEVCSPS *sps1, const HEVCSPS *sps2);
+
 int ff_hevc_decode_nal_vps(GetBitContext *gb, AVCodecContext *avctx,
                            HEVCParamSets *ps);
 int ff_hevc_decode_nal_sps(GetBitContext *gb, AVCodecContext *avctx,
