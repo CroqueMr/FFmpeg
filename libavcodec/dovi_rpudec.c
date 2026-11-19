@@ -319,6 +319,17 @@ static int parse_ext_blocks(DOVIContext *s, GetBitContext *gb, int ver,
 
         memset(dm, 0, sizeof(*dm));
         dm->level = level;
+        /* Validate before copying from the bitreader, including non-byte-aligned
+         * block starts. Static/compressed state inherits this trailer naturally. */
+        if (ext_block_length < 0 || ext_block_length > get_bits_left(gb) / 8)
+            return AVERROR_INVALIDDATA;
+        dm->dvbridge_original_length = ext_block_length;
+        if (ext_block_length <= sizeof(dm->dvbridge_original_bytes)) {
+            GetBitContext raw = *gb;
+            for (int j = 0; j < ext_block_length; j++)
+                dm->dvbridge_original_bytes[j] = get_bits(&raw, 8);
+            dm->dvbridge_raw_magic = 0x41424456;
+        }
         switch (ver) {
         case 1: ret = parse_ext_v1(s, gb, dm); break;
         case 2: ret = parse_ext_v2(s, gb, dm, ext_block_length); break;
@@ -405,6 +416,9 @@ int ff_dovi_rpu_parse(DOVIContext *s, const uint8_t *rpu, size_t rpu_size,
         VALIDATE(rpu[0], 25, 25); /* NAL prefix */
         rpu++;
         rpu_size--;
+        /* Strip trailing padding zero bytes */
+        while (rpu_size && !rpu[rpu_size - 1])
+            rpu_size--;
     }
 
     if ((ret = init_get_bits8(gb, rpu, rpu_size)) < 0)
@@ -708,7 +722,8 @@ int ff_dovi_rpu_parse(DOVIContext *s, const uint8_t *rpu, size_t rpu_size,
             return ret;
         }
 
-        if (get_bits_left(gb) > 48 /* padding + CRC32 + terminator */) {
+        /* ue(1) + ue(0) + level + CRC32 + terminator */
+        if (get_bits_left(gb) >= 3 + 1 + 8 + 32 + 8) {
             if ((ret = parse_ext_blocks(s, gb, 2, dm_compression, err_recognition)) < 0) {
                 ff_dovi_ctx_unref(s);
                 return ret;
