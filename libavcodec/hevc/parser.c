@@ -291,6 +291,11 @@ static int hevc_find_frame_end(AVCodecParserContext *s, const uint8_t *buf,
             int first_slice_segment_in_pic_flag = buf[i] >> 7;
             if (first_slice_segment_in_pic_flag) {
                 if (!pc->frame_start_found) {
+                    /* Capture the real clock across a split NAL header before
+                     * later PES chunks overwrite its timestamp descriptor. */
+                    for (int off = i; off >= i - 5 - !((pc->state64 >> 6 * 8) & 0xFF) &&
+                         s->pts == AV_NOPTS_VALUE && s->dts == AV_NOPTS_VALUE; off--)
+                        ff_fetch_timestamp(s, off, 0, 0);
                     pc->frame_start_found = 1;
                 } else { // First slice of next frame found
                     pc->frame_start_found = 0;
