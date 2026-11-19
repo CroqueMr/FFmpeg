@@ -51,9 +51,10 @@ static void ref_from_h264pic(H264Ref *dst, const H264Picture *src)
 {
     memcpy(dst->data,     src->f->data,     sizeof(dst->data));
     memcpy(dst->linesize, src->f->linesize, sizeof(dst->linesize));
-    dst->reference = src->reference;
-    dst->poc       = src->poc;
-    dst->pic_id    = src->pic_id;
+    dst->reference  = src->reference;
+    dst->poc        = src->poc;
+    dst->pic_id     = src->pic_id;
+    dst->inter_view = 0;
     dst->parent = src;
 }
 
@@ -130,8 +131,76 @@ static int mismatches_ref(const H264Context *h, const H264Picture *pic)
             h->cur_pic_ptr->f->format != f->format);
 }
 
+/**
+ * Append the inter-view reference pictures to an initial reference picture list,
+ * cf. H.8.2.1.
+ *
+ * The dependent views this view may predict from are listed in the MVC extension
+ * of its subset SPS, by view_id, in a separate list for anchor and non-anchor
+ * pictures. The picture used is the one that view holds for the access unit being
+ * decoded, which is exactly what H264ViewContext.cur_pic_ptr records.
+ */
+static int build_inter_view_list(H264Context *h, H264Ref *dst, int dst_len,
+                                 int list, int anchor)
+{
+    const SPS *sps = h->ps.sps;
+    const SPSMVCExt *mvc = &sps->mvc;
+    const unsigned voidx = h->cur_view;
+    int nb_refs, index = 0;
+    const uint16_t *refs;
+
+    if (!sps->is_subset || voidx == 0 || voidx >= mvc->num_views)
+        return 0;
+
+    if (anchor) {
+        nb_refs = mvc->num_anchor_refs[list][voidx];
+        refs    = mvc->anchor_ref[list][voidx];
+    } else {
+        nb_refs = mvc->num_non_anchor_refs[list][voidx];
+        refs    = mvc->non_anchor_ref[list][voidx];
+    }
+
+    for (int i = 0; i < nb_refs && index < dst_len; i++) {
+        int ref_voidx = ff_h264_view_idx(h, refs[i]);
+        H264Picture *pic;
+
+        if (ref_voidx < 0 || ref_voidx >= FF_ARRAY_ELEMS(h->views)) {
+            av_log(h->avctx, AV_LOG_WARNING,
+                   "Inter-view reference view_id %u of view %u is not present\n",
+                   refs[i], voidx);
+            continue;
+        }
+
+        pic = h->views[ref_voidx].cur_pic_ptr;
+        if (!pic || !pic->f->buf[0]) {
+            av_log(h->avctx, AV_LOG_WARNING,
+                   "Inter-view reference for view %u is missing\n", voidx);
+            continue;
+        }
+
+        ref_from_h264pic(&dst[index], pic);
+
+        /* Whether a picture may be used for inter-view prediction is signalled by
+         * inter_view_flag, independently of whether it is a temporal reference
+         * picture; a disposable picture of another view is still available here.
+         * So do not take H264Picture.reference, which may well be 0, and mark the
+         * reference as present for the current picture structure instead. */
+        dst[index].reference = h->picture_structure;
+        if (h->picture_structure != PICT_FRAME)
+            pic_as_field(&dst[index], h->picture_structure);
+
+        /* Inter-view references behave as long term ones for the purposes of
+         * temporal direct prediction, cf. H.8.2.1. */
+        dst[index].inter_view = 1;
+        index++;
+    }
+
+    return index;
+}
+
 static void h264_initialise_ref_list(H264Context *h, H264SliceContext *sl)
 {
+    const int anchor = sl->anchor_pic_flag;
     int len;
 
     if (sl->slice_type_nos == AV_PICTURE_TYPE_B) {
@@ -154,6 +223,9 @@ static void h264_initialise_ref_list(H264Context *h, H264SliceContext *sl)
             len += build_def_list(sl->ref_list[list] + len,
                                   FF_ARRAY_ELEMS(sl->ref_list[0]) - len,
                                   h->long_ref, 16, 1, h->picture_structure);
+            len += build_inter_view_list(h, sl->ref_list[list] + len,
+                                         FF_ARRAY_ELEMS(sl->ref_list[0]) - len,
+                                         list, anchor);
             av_assert0(len <= 32);
 
             memset(&sl->ref_list[list][len], 0, sizeof(H264Ref) * (32 - len));
@@ -175,6 +247,9 @@ static void h264_initialise_ref_list(H264Context *h, H264SliceContext *sl)
         len += build_def_list(sl->ref_list[0] + len,
                               FF_ARRAY_ELEMS(sl->ref_list[0]) - len,
                               h-> long_ref, 16, 1, h->picture_structure);
+        len += build_inter_view_list(h, sl->ref_list[0] + len,
+                                     FF_ARRAY_ELEMS(sl->ref_list[0]) - len,
+                                     0, anchor);
         av_assert0(len <= 32);
 
         memset(&sl->ref_list[0][len], 0, sizeof(H264Ref) * (32 - len));
@@ -298,11 +373,14 @@ int ff_h264_build_ref_list(H264Context *h, H264SliceContext *sl)
 
     for (int list = 0; list < sl->list_count; list++) {
         int pred = sl->curr_pic_num;
+        /* picViewIdxLXPred of H.8.2.2.3, which starts out at -1 for each list */
+        int view_pred = -1;
 
         for (int index = 0; index < sl->nb_ref_modifications[list]; index++) {
             unsigned int modification_of_pic_nums_idc = sl->ref_modifications[list][index].op;
             unsigned int                          val = sl->ref_modifications[list][index].val;
-            unsigned int pic_id;
+            unsigned int pic_id = 0;
+            int is_inter_view = 0;
             int i, pic_structure;
             H264Picture *ref = NULL;
 
@@ -359,11 +437,64 @@ int ff_h264_build_ref_list(H264Context *h, H264SliceContext *sl)
                 }
                 break;
             }
+            case 4:
+            case 5: {
+                /* Inter-view reference picture list modification, H.8.2.2.3. The
+                 * value indexes the inter-view dependency list of this view, and
+                 * names a view rather than a picture. */
+                const SPSMVCExt *mvc = &h->ps.sps->mvc;
+                const unsigned voidx = h->cur_view;
+                const int abs_diff_view_idx = val + 1;
+                const uint16_t *refs;
+                int nb_refs, ref_voidx;
+
+                is_inter_view = 1;
+
+                if (!h->ps.sps->is_subset || !voidx || voidx >= mvc->num_views) {
+                    i = -1;
+                    break;
+                }
+
+                if (sl->anchor_pic_flag) {
+                    nb_refs = mvc->num_anchor_refs[list][voidx];
+                    refs    = mvc->anchor_ref[list][voidx];
+                } else {
+                    nb_refs = mvc->num_non_anchor_refs[list][voidx];
+                    refs    = mvc->non_anchor_ref[list][voidx];
+                }
+                if (nb_refs <= 0) {
+                    i = -1;
+                    break;
+                }
+
+                if (modification_of_pic_nums_idc == 4) {
+                    view_pred -= abs_diff_view_idx;
+                    if (view_pred < 0)
+                        view_pred += nb_refs;
+                } else {
+                    view_pred += abs_diff_view_idx;
+                    if (view_pred >= nb_refs)
+                        view_pred -= nb_refs;
+                }
+                if (view_pred < 0 || view_pred >= nb_refs) {
+                    i = -1;
+                    break;
+                }
+
+                ref_voidx = ff_h264_view_idx(h, refs[view_pred]);
+                if (ref_voidx < 0 || ref_voidx >= FF_ARRAY_ELEMS(h->views)) {
+                    i = -1;
+                    break;
+                }
+                ref = h->views[ref_voidx].cur_pic_ptr;
+                i   = (ref && ref->f->buf[0]) ? 0 : -1;
+                break;
+            }
             default:
                 av_assert0(0);
             }
 
-            if (i < 0 || mismatches_ref(h, ref)) {
+            if (i < 0 || (!is_inter_view && mismatches_ref(h, ref))) {
                 av_log(h->avctx, AV_LOG_ERROR,
                        i < 0 ? "reference picture missing during reorder\n" :
                                "mismatching reference\n"
@@ -372,6 +503,23 @@ int ff_h264_build_ref_list(H264Context *h, H264SliceContext *sl)
                     return AVERROR_INVALIDDATA;
                 }
                 memset(&sl->ref_list[list][index], 0, sizeof(sl->ref_list[0][0])); // FIXME
+            } else if (is_inter_view) {
+                /* Duplicates are identified by view rather than by pic_id here,
+                 * cf. the viewID() term of H-4. */
+                for (i = index; i + 1 < sl->ref_count[list]; i++) {
+                    if (sl->ref_list[list][i].parent &&
+                        sl->ref_list[list][i].inter_view &&
+                        sl->ref_list[list][i].parent->view_id == ref->view_id)
+                        break;
+                }
+                for (; i > index; i--)
+                    sl->ref_list[list][i] = sl->ref_list[list][i - 1];
+
+                ref_from_h264pic(&sl->ref_list[list][index], ref);
+                sl->ref_list[list][index].reference = h->picture_structure;
+                if (FIELD_PICTURE(h))
+                    pic_as_field(&sl->ref_list[list][index], h->picture_structure);
+                sl->ref_list[list][index].inter_view = 1;
             } else {
                 for (i = index; i + 1 < sl->ref_count[list]; i++) {
                     if (sl->ref_list[list][i].parent &&
@@ -446,7 +594,9 @@ int ff_h264_decode_ref_pic_list_reordering(H264SliceContext *sl, void *logctx)
             if (index >= sl->ref_count[list]) {
                 av_log(logctx, AV_LOG_ERROR, "reference count overflow\n");
                 return AVERROR_INVALIDDATA;
-            } else if (op > 2) {
+            } else if (op > 2 && !(sl->is_mvc && op <= 5)) {
+                /* 4 and 5 are the inter-view modifications of
+                 * ref_pic_list_mvc_modification(), H.7.3.3.1.1 */
                 av_log(logctx, AV_LOG_ERROR,
                        "illegal modification_of_pic_nums_idc %u\n",
                        op);
@@ -477,6 +627,13 @@ static inline int unreference_pic(H264Context *h, H264Picture *pic, int refmask)
     if (pic->reference &= refmask) {
         return 0;
     } else {
+        /* A dependent view picture is not in delayed_pic -- reordering is driven
+         * by the base view -- but is still awaiting output alongside the base view
+         * picture it is paired with, until resolve_view_pair() clears the link. */
+        if (pic->base_view_pic >= 0) {
+            pic->reference = DELAYED_PIC_REF;
+            return 1;
+        }
         for (int i = 0; h->delayed_pic[i]; i++)
             if(pic == h->delayed_pic[i]){
                 pic->reference = DELAYED_PIC_REF;
@@ -585,6 +742,120 @@ void ff_h264_remove_all_refs(H264Context *h)
     memset(h->default_ref, 0, sizeof(h->default_ref));
 }
 
+int ff_h264_view_idx(const H264Context *h, int view_id)
+{
+    const SPS *sps = h->ps.pps ? h->ps.pps->sps_mvc : NULL;
+
+    /* The base view's PPS may not point at a subset SPS, so fall back to any
+     * subset SPS that declares views. */
+    if (!sps || sps->mvc.num_views < 2) {
+        sps = NULL;
+        for (int i = 0; i < MAX_SPS_COUNT; i++)
+            if (h->ps.subset_sps_list[i] && h->ps.subset_sps_list[i]->mvc.num_views > 1) {
+                sps = h->ps.subset_sps_list[i];
+                break;
+            }
+    }
+    if (!sps)
+        return AVERROR_INVALIDDATA;
+
+    for (int i = 0; i < sps->mvc.num_views; i++)
+        if (sps->mvc.view_id[i] == view_id)
+            return i;
+
+    return AVERROR_INVALIDDATA;
+}
+
+/* The field pair state has to follow the view too, but only when the switch is
+ * part of decoding a slice: idr() and the frame thread hand-over walk the views
+ * for their own reasons and must not disturb the picture being decoded. */
+int ff_h264_view_switch_fields(H264Context *h, unsigned view)
+{
+    H264ViewContext *out, *in;
+    int ret;
+
+    if (view == h->cur_view)
+        return 0;
+
+    out = &h->views[h->cur_view];
+    out->first_field       = h->first_field;
+    out->picture_structure = h->picture_structure;
+    out->droppable         = h->droppable;
+    out->missing_fields    = h->missing_fields;
+    out->pending_field_pic = h->first_field ? h->cur_pic_ptr : NULL;
+
+    in  = &h->views[view];
+    ff_h264_view_switch(h, view);
+
+    h->first_field       = in->first_field;
+    h->picture_structure = in->picture_structure;
+    h->droppable         = in->droppable;
+    h->missing_fields    = in->missing_fields;
+    h->cur_pic_ptr       = in->pending_field_pic;
+
+    /* h->cur_pic is a reference to the picture being decoded into, refreshed by
+     * h264_frame_start() -- which the second field of a complementary pair does
+     * not go through. Rebind it to the view being switched to, or that field
+     * would be decoded into whichever view started a picture most recently. */
+    ff_h264_unref_picture(&h->cur_pic);
+    if (h->cur_pic_ptr) {
+        ret = ff_h264_ref_picture(&h->cur_pic, h->cur_pic_ptr);
+        if (ret < 0)
+            return ret;
+        for (int i = 0; i < h->nb_slice_ctx; i++) {
+            h->slice_ctx[i].linesize   = h->cur_pic_ptr->f->linesize[0];
+            h->slice_ctx[i].uvlinesize = h->cur_pic_ptr->f->linesize[1];
+        }
+    }
+
+    return 0;
+}
+
+void ff_h264_view_switch(H264Context *h, unsigned view)
+{
+    H264ViewContext *v;
+
+    av_assert1(view < FF_ARRAY_ELEMS(h->views));
+
+    if (view == h->cur_view)
+        return;
+
+    /* save the outgoing view */
+    v = &h->views[h->cur_view];
+    v->poc             = h->poc;
+    v->short_ref_count = h->short_ref_count;
+    v->long_ref_count  = h->long_ref_count;
+    memcpy(v->short_ref, h->short_ref, sizeof(v->short_ref));
+    memcpy(v->long_ref,  h->long_ref,  sizeof(v->long_ref));
+
+    /* restore the incoming one */
+    v = &h->views[view];
+    h->poc             = v->poc;
+    h->short_ref_count = v->short_ref_count;
+    h->long_ref_count  = v->long_ref_count;
+    memcpy(h->short_ref, v->short_ref, sizeof(h->short_ref));
+    memcpy(h->long_ref,  v->long_ref,  sizeof(h->long_ref));
+
+    h->cur_view = view;
+}
+
+void ff_h264_view_reset(H264Context *h)
+{
+    for (int i = 0; i < FF_ARRAY_ELEMS(h->views); i++) {
+        H264ViewContext *v = &h->views[i];
+
+        /* The pictures themselves are owned by the DPB, which is torn down
+         * separately; only the per-view bookkeeping is dropped here. */
+        memset(v->short_ref, 0, sizeof(v->short_ref));
+        memset(v->long_ref,  0, sizeof(v->long_ref));
+        v->short_ref_count = 0;
+        v->long_ref_count  = 0;
+        v->cur_pic_ptr     = NULL;
+        memset(&v->poc, 0, sizeof(v->poc));
+    }
+    h->cur_view = 0;
+}
+
 static void generate_sliding_window_mmcos(H264Context *h)
 {
     MMCO *mmco = h->mmco;
@@ -623,6 +894,7 @@ int ff_h264_execute_ref_pic_marking(H264Context *h)
     if (!h->explicit_ref_marking)
         generate_sliding_window_mmcos(h);
     mmco_count = h->nb_mmco;
+
 
     if ((h->avctx->debug & FF_DEBUG_MMCO) && mmco_count == 0)
         av_log(h->avctx, AV_LOG_DEBUG, "no mmco here\n");
@@ -835,7 +1107,7 @@ int ff_h264_decode_ref_pic_marking(H264SliceContext *sl, GetBitContext *gb,
     MMCO *mmco = sl->mmco;
     int nb_mmco = 0;
 
-    if (nal->type == H264_NAL_IDR_SLICE) { // FIXME fields
+    if (ff_h264_nal_is_idr(nal)) { // FIXME fields
         skip_bits1(gb); // broken_link
         if (get_bits1(gb)) {
             mmco[0].opcode   = MMCO_LONG;

@@ -155,6 +155,14 @@ typedef struct H264Picture {
 
     const PPS   *pps;
 
+    /** MVC view_id of this picture; 0 for a stream that is not multiview */
+    int view_id;
+    /**
+     * For a dependent view picture, the DPB index of the base view picture of the
+     * same access unit, else -1. Used to pair the views up at output time.
+     */
+    int base_view_pic;
+
     int mb_width, mb_height;
     int mb_stride;
 
@@ -171,6 +179,11 @@ typedef struct H264Ref {
     int reference;
     int poc;
     int pic_id;
+    /**
+     * Set for an inter-view reference (MVC). Such a reference behaves as a long
+     * term one for temporal direct prediction, cf. H.8.2.1.
+     */
+    int inter_view;
 
     const H264Picture *parent;
 } H264Ref;
@@ -244,12 +257,23 @@ typedef struct H264SliceContext {
 
     int redundant_pic_count;
 
+    /** whether this is a coded slice extension, i.e. belongs to a dependent view */
+    int is_mvc;
+    /** anchor_pic_flag of the MVC NAL unit header, 0 for a base view slice */
+    int anchor_pic_flag;
+
     /**
      * number of neighbors (top and/or left) that used 8x8 dct
      */
     int neighbor_transform_size;
 
     int direct_spatial_mv_pred;
+    /**
+     * Whether the colocated picture, ref_list[1][0], is a long term or inter-view
+     * reference, in which case its motion vectors are not used by temporal direct
+     * prediction. Derived once per slice by ff_h264_direct_ref_list_init().
+     */
+    int col_long_ref;
     int col_parity;
     int col_fieldoff;
 
@@ -331,6 +355,45 @@ typedef struct H264SliceContext {
     int curr_pic_num;
     int max_pic_num;
 } H264SliceContext;
+
+/**
+ * Per-view decoding state for MVC (H.264 Annex H).
+ *
+ * An MVC access unit is strictly ordered -- all base view slices, then all slices
+ * of each dependent view -- so only one view is ever being decoded at a time.
+ * Rather than addressing every view's state explicitly, the state of the view
+ * currently being decoded stays in the H264Context fields it has always lived in,
+ * and ff_h264_view_switch() swaps it in and out of here at view boundaries. That
+ * way the macroblock layer, the reference list code and all the hwaccels keep
+ * addressing h->cur_pic_ptr, h->short_ref and h->poc directly and need no
+ * knowledge of views whatsoever.
+ */
+typedef struct H264ViewContext {
+    H264POCContext  poc;
+    H264Picture    *short_ref[32];
+    H264Picture    *long_ref[32];
+    int             short_ref_count;
+    int             long_ref_count;
+
+    /**
+     * The picture this view holds for the access unit being decoded, used to pair
+     * the views up at output time. Unlike the fields above this is not swapped;
+     * it stays valid across a view switch.
+     */
+    H264Picture    *cur_pic_ptr;
+
+    /**
+     * Field pair state, swapped like the fields above. A field coded access unit
+     * carries one field of each view, so a view is left half way through a
+     * complementary pair whenever the next view starts, and each view has to
+     * remember its own pending field.
+     */
+    H264Picture    *pending_field_pic;
+    int             first_field;
+    int             picture_structure;
+    int             droppable;
+    int             missing_fields;
+} H264ViewContext;
 
 /**
  * H264Context
@@ -552,6 +615,78 @@ typedef struct H264Context {
      * slices) anymore */
     int setup_finished;
 
+    /**
+     * @name MVC (H.264 Annex H) multiview state
+     * @{
+     */
+    /**
+     * The subset SPS whose MVC extension declared the current view list, used
+     * only to notice when it appears or changes. Borrowed, never dereferenced
+     * after the fact.
+     */
+    const SPS *mvc_sps;
+
+    /** Per-view decoding state, indexed by view order index (VOIdx). */
+    H264ViewContext views[H264_MAX_MVC_VIEWS];
+
+    /**
+     * Frames ready for output. A multiview access unit produces one frame per
+     * view, so a single packet can yield more than one frame.
+     */
+    struct AVContainerFifo *output_fifo;
+    /** Scratch frame used to hand a finished picture to ::output_fifo. */
+    AVFrame *output_frame;
+    /**
+     * DTS of the packet being decoded, stamped onto every frame pushed to
+     * ::output_fifo. receive_frame() decoders do this themselves; the generic
+     * layer only fills AVFrame.pkt_dts in for the decode() callback.
+     */
+    int64_t pkt_dts;
+    /**
+     * The base view picture that most recently left the reorder buffer, and whose
+     * paired dependent view pictures therefore need resolving: output alongside it
+     * if it is being output, dropped with it otherwise.
+     */
+    H264Picture *pending_pair_pic;
+    /**
+     * Whether ::pending_pair_pic was selected for output, and its paired dependent
+     * view pictures therefore have to be output too. Not derivable from
+     * ::next_output_pic, which is cleared once the picture has been copied out at
+     * the end of a packet: a stream whose access unit boundaries do not line up
+     * with its packets -- some Matroska files start a packet on the dependent view
+     * slices of the previous access unit -- reaches the dependent view only after
+     * that has happened.
+     */
+    int pending_pair_output;
+    /**
+     * Dependent view picture released by ::pending_pair_pic and due to be output
+     * with it. Handled exactly like ::next_output_pic: chosen during setup, so
+     * that a frame thread starting afterwards inherits no work, and copied out
+     * at the end of the packet.
+     */
+    H264Picture *next_output_pic_dep;
+    /**
+     * Number of views in the active subset SPS, or 0 if the stream is not
+     * multiview (or its MVC extension is unsupported).
+     */
+    unsigned nb_views;
+    /** VOIdx of the view currently being decoded. */
+    unsigned cur_view;
+    /** Bitmasks of VOIdx that are decoded / output. Bit 0 (base view) is always set. */
+    unsigned views_active_decode;
+    unsigned views_active_output;
+
+    /* multiview AVOptions, mirroring the hevc decoder */
+    int         *view_ids;
+    unsigned  nb_view_ids;
+
+    unsigned    *view_ids_available;
+    unsigned  nb_view_ids_available;
+
+    unsigned    *view_pos_available;
+    unsigned  nb_view_pos_available;
+    /** @} */
+
     int cur_chroma_format_idc;
     int cur_bit_depth_luma;
     int16_t slice_row[MAX_SLICES]; ///< to detect when MAX_SLICES is too low
@@ -594,7 +729,54 @@ int ff_h264_alloc_tables(H264Context *h);
 
 int ff_h264_decode_ref_pic_list_reordering(H264SliceContext *sl, void *logctx);
 int ff_h264_build_ref_list(H264Context *h, H264SliceContext *sl);
+/**
+ * Whether a VCL NAL unit starts an IDR picture.
+ *
+ * In a coded slice extension this is signalled by non_idr_flag in the MVC NAL
+ * unit header rather than by the NAL unit type, cf. H.7.4.1.1.
+ */
+static inline int ff_h264_nal_is_idr(const H2645NAL *nal)
+{
+    if (nal->type == H264_NAL_EXTEN_SLICE)
+        return !nal->non_idr_flag;
+    return nal->type == H264_NAL_IDR_SLICE;
+}
+
 void ff_h264_remove_all_refs(H264Context *h);
+
+/**
+ * Release the dependent view pictures paired with a base view picture that has
+ * left the reorder buffer, and select them for output if the base view picture
+ * is itself being output. With defer set the picture is recorded in
+ * ::next_output_pic_dep rather than pushed to the output fifo, so that the
+ * release is complete before ff_thread_finish_setup().
+ */
+int ff_h264_resolve_view_pair(H264Context *h, H264Picture *base, int output,
+                              int defer);
+
+/**
+ * Make @p view the view being decoded, saving the state of the previously
+ * current view and restoring that of @p view.
+ *
+ * Must be called at every view boundary within an access unit, and to return to
+ * the base view before starting the next one. Calling it for the view that is
+ * already current is a no-op.
+ */
+void ff_h264_view_switch(H264Context *h, unsigned view);
+int ff_h264_view_switch_fields(H264Context *h, unsigned view);
+
+/**
+ * Map a view_id onto its view order index (VOIdx), i.e. its position in the
+ * view_id[] list of the active subset SPS, cf. H.7.4.1.1.
+ *
+ * @return the VOIdx, or a negative value if the stream declares no such view.
+ */
+int ff_h264_view_idx(const H264Context *h, int view_id);
+
+/**
+ * Reset all per-view state, as at an IDR or a flush.
+ */
+void ff_h264_view_reset(H264Context *h);
 
 /**
  * Execute the reference picture marking (memory management control operations).
