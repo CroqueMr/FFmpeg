@@ -237,6 +237,7 @@ int ff_itut_t35_parse_payload_to_struct(FFITUTT35 *const itut_t35, FFITUTT35Aux 
                 return ret;
             }
 
+            hdr_plus->itu_t_t35_country_code = itut_t35->country_code;
             av_buffer_unref(&metadata->hdr_plus);
             metadata->hdr_plus = av_buffer_create((uint8_t *)hdr_plus, size, NULL, NULL, 0);
             if (!metadata->hdr_plus) {

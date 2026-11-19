@@ -4101,6 +4101,7 @@ static int matroska_parse_block_additional(MatroskaDemuxContext *matroska,
                 if (!hdrplus)
                     return AVERROR(ENOMEM);
 
+                hdrplus->itu_t_t35_country_code = country_code;
                 if ((res = av_dynamic_hdr_plus_from_t35(hdrplus, bc.buffer,
                                                         bytestream2_get_bytes_left(&bc))) < 0 ||
                     (res = av_packet_add_side_data(pkt, AV_PKT_DATA_DYNAMIC_HDR10_PLUS,
