@@ -55,6 +55,7 @@
 #include "libavcodec/bytestream.h"
 #include "libavcodec/defs.h"
 #include "libavcodec/flac.h"
+#include "libavcodec/hevc/hevc.h"
 #include "libavcodec/itut35.h"
 #include "libavcodec/mpeg4audio.h"
 #include "packet_internal.h"
@@ -296,6 +297,7 @@ typedef struct MatroskaTrack {
 
     uint32_t palette[AVPALETTE_COUNT];
     int has_palette;
+    int dovi_vcl, dovi_rpu, dovi_joined;
 } MatroskaTrack;
 
 typedef struct MatroskaAttachment {
@@ -3348,9 +3350,50 @@ static int matroska_parse_tracks(AVFormatContext *s)
     return 0;
 }
 
-static int matroska_parse_dovi_streams(AVFormatContext *s, const AVPacket *pkt)
+/* Implicit dual-track remuxes share the authored VPS. Ordinary 4K and
+ * 1080p alternatives in the same container need not share a coding layer. */
+static unsigned matroska_dovi_vps(const AVCodecParameters *par, const uint8_t **vps)
 {
-    AVStream *bl_st = NULL, *el_st = NULL;
+    const uint8_t *data = par->extradata;
+    unsigned remaining, arrays;
+
+    if (par->extradata_size < 23 || data[0] != 1)
+        return 0;
+    arrays = data[22];
+    data += 23;
+    remaining = par->extradata_size - 23;
+    for (unsigned i = 0; i < arrays && remaining >= 3; i++) {
+        unsigned type = data[0] & 63;
+        unsigned count = AV_RB16(data + 1);
+        data += 3;
+        remaining -= 3;
+        for (unsigned j = 0; j < count; j++) {
+            unsigned size;
+            if (remaining < 2)
+                return 0;
+            size = AV_RB16(data);
+            data += 2;
+            remaining -= 2;
+            if (size < 3 || size > remaining)
+                return 0;
+            if (type == HEVC_NAL_VPS && (data[0] >> 1) == HEVC_NAL_VPS) {
+                *vps = data;
+                return size;
+            }
+            data += size;
+            remaining -= size;
+        }
+    }
+    return 0;
+}
+
+static int matroska_parse_dovi_streams(MatroskaDemuxContext *matroska,
+                                       MatroskaTrack *current, const AVPacket *pkt)
+{
+    AVFormatContext *s = matroska->ctx;
+    MatroskaTrack *tracks = matroska->tracks.elem;
+    MatroskaTrack *peer = NULL;
+    AVStream *bl_st = NULL, *el_st = NULL, *declared_el = NULL;
     const AVPacketSideData *source_config = NULL;
     AVStreamGroup *stg;
     const uint8_t *data;
@@ -3363,12 +3406,12 @@ static int matroska_parse_dovi_streams(AVFormatContext *s, const AVPacket *pkt)
         s->streams[pkt->stream_index]->codecpar->codec_id != AV_CODEC_ID_HEVC)
         return 0;
 
-    for (int i = 0; i < s->nb_streams; i++) {
-        AVStream *st = s->streams[i];
+    for (unsigned i = 0; i < matroska->tracks.nb_elem; i++) {
+        AVStream *st = tracks[i].stream;
         const AVPacketSideData *sd;
         const AVDOVIDecoderConfigurationRecord *dovi;
 
-        if (st->codecpar->codec_id != AV_CODEC_ID_HEVC)
+        if (!st || st->codecpar->codec_id != AV_CODEC_ID_HEVC)
             continue;
 
         sd = av_packet_side_data_get(st->codecpar->coded_side_data,
@@ -3378,6 +3421,11 @@ static int matroska_parse_dovi_streams(AVFormatContext *s, const AVPacket *pkt)
             dovi = (const AVDOVIDecoderConfigurationRecord *)sd->data;
             if (dovi->dv_profile != 7 || !dovi->el_present_flag || !dovi->rpu_present_flag)
                 return 0;
+            if (!dovi->bl_present_flag) {
+                if (declared_el)
+                    return 0;
+                declared_el = st;
+            }
             if (!source_config || st->index == pkt->stream_index)
                 source_config = sd;
         }
@@ -3388,6 +3436,7 @@ static int matroska_parse_dovi_streams(AVFormatContext *s, const AVPacket *pkt)
             if (bl_st)
                 return 0;
             bl_st = st;
+            peer = &tracks[i];
         }
     }
 
@@ -3405,22 +3454,45 @@ static int matroska_parse_dovi_streams(AVFormatContext *s, const AVPacket *pkt)
         remaining -= length_size;
         if (size < 2 || size > remaining || (data[0] & 0x80) || !(data[1] & 7))
             return 0;
-        if ((data[0] >> 1) == 63) /* Already joined BL+EL, not an independent layer. */
+        if ((data[0] >> 1) == 63) {
+            /* An interleaved track cannot be the peer of a declared separate track. */
+            current->dovi_joined = 1;
             return 0;
+        }
         has_vcl |= (data[0] >> 1) < 32;
         has_rpu |= (data[0] >> 1) == 62;
         data += size;
         remaining -= size;
     }
-    if (remaining || !has_rpu || !has_vcl)
+    if (remaining || !has_vcl)
+        return 0;
+    current->dovi_vcl = 1;
+    current->dovi_rpu |= has_rpu;
+    if (!peer->dovi_vcl || current->dovi_joined || peer->dovi_joined ||
+        !(current->dovi_rpu || peer->dovi_rpu))
         return 0;
 
-    /* RPU can be carried by the larger BL, not just by the EL. */
-    if (el_st->codecpar->width >= bl_st->codecpar->width &&
-        el_st->codecpar->height >= bl_st->codecpar->height &&
-        (el_st->codecpar->width > bl_st->codecpar->width ||
-         el_st->codecpar->height > bl_st->codecpar->height))
-        FFSWAP(AVStream *, bl_st, el_st);
+    /* The RPU establishes Dolby Vision carriage, not the role of its track.
+     * Equal-sized tracks need an explicit EL-only configuration to disambiguate. */
+    if (declared_el) {
+        if (declared_el != el_st)
+            FFSWAP(AVStream *, bl_st, el_st);
+    } else {
+        if (el_st->codecpar->width == bl_st->codecpar->width &&
+            el_st->codecpar->height == bl_st->codecpar->height)
+            return 0;
+        if (el_st->codecpar->width >= bl_st->codecpar->width &&
+            el_st->codecpar->height >= bl_st->codecpar->height)
+            FFSWAP(AVStream *, bl_st, el_st);
+
+        const uint8_t *bl_vps, *el_vps;
+        unsigned bl_size = matroska_dovi_vps(bl_st->codecpar, &bl_vps);
+        unsigned el_size = matroska_dovi_vps(el_st->codecpar, &el_vps);
+        if (!bl_size || bl_size != el_size || memcmp(bl_vps, el_vps, bl_size) ||
+            2LL * el_st->codecpar->width != bl_st->codecpar->width ||
+            2LL * el_st->codecpar->height != bl_st->codecpar->height)
+            return 0;
+    }
     if (el_st->codecpar->width > bl_st->codecpar->width ||
         el_st->codecpar->height > bl_st->codecpar->height ||
         el_st->codecpar->extradata_size < 23 || el_st->codecpar->extradata[0] != 1)
@@ -4292,7 +4364,7 @@ static int matroska_parse_frame(MatroskaDemuxContext *matroska,
     pkt->pos = pos;
     pkt->duration = lace_duration;
 
-    res = matroska_parse_dovi_streams(matroska->ctx, pkt);
+    res = matroska_parse_dovi_streams(matroska, track, pkt);
     if (res < 0) {
         av_packet_unref(pkt);
         return res;
