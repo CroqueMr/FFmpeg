@@ -1470,6 +1470,7 @@ int ff_hevc_parse_sps(HEVCSPS *sps, GetBitContext *gb, unsigned int *sps_id,
     sps->max_transform_hierarchy_depth_inter = get_ue_golomb_long(gb);
     sps->max_transform_hierarchy_depth_intra = get_ue_golomb_long(gb);
 
+    sps->scaling_list_start_bit = get_bits_count(gb);
     sps->scaling_list_enabled = get_bits1(gb);
     if (sps->scaling_list_enabled) {
         set_default_scaling_list_data(&sps->scaling_list);
@@ -1486,6 +1487,7 @@ int ff_hevc_parse_sps(HEVCSPS *sps, GetBitContext *gb, unsigned int *sps_id,
         }
     }
 
+    sps->scaling_list_end_bit = get_bits_count(gb);
     sps->amp_enabled = get_bits1(gb);
     sps->sao_enabled = get_bits1(gb);
 
@@ -1745,6 +1747,7 @@ int ff_hevc_decode_nal_sps(GetBitContext *gb, AVCodecContext *avctx,
 
     av_log(avctx, AV_LOG_DEBUG, "Decoding SPS\n");
 
+    sps->data_bits = gb->size_in_bits;
     sps->data_size = get_bits_bytesize(gb, 1);
     sps->data = av_memdup(gb->buffer, sps->data_size);
     if (!sps->data) {

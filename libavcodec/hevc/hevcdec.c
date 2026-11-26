@@ -3194,6 +3194,47 @@ static int find_finish_setup_nal(const HEVCContext *s)
     return nal_idx;
 }
 
+static int equal_rbsp_bits(const uint8_t *a, int pos_a,
+                           const uint8_t *b, int pos_b, int count)
+{
+    while (count > 0) {
+        int avail_a = 8 - (pos_a & 7);
+        int avail_b = 8 - (pos_b & 7);
+        int n = FFMIN3(count, avail_a, avail_b);
+        int bits_a = a[pos_a >> 3] >> (avail_a - n);
+        int bits_b = b[pos_b >> 3] >> (avail_b - n);
+        if ((bits_a ^ bits_b) & ((1 << n) - 1))
+            return 0;
+        pos_a += n;
+        pos_b += n;
+        count -= n;
+    }
+    return 1;
+}
+
+static int valid_scaling_list_range(const HEVCSPS *sps)
+{
+    return sps->data && sps->scaling_list_start_bit >= 0 &&
+           sps->scaling_list_start_bit < sps->scaling_list_end_bit &&
+           sps->scaling_list_end_bit <= sps->data_bits &&
+           sps->data_bits <= (int64_t)sps->data_size * 8;
+}
+
+static int sps_equal_except_scaling_list(const HEVCSPS *a, const HEVCSPS *b)
+{
+    int tail;
+
+    if (!valid_scaling_list_range(a) || !valid_scaling_list_range(b))
+        return 0;
+    tail = a->data_bits - a->scaling_list_end_bit;
+
+    return a->scaling_list_start_bit == b->scaling_list_start_bit &&
+           tail == b->data_bits - b->scaling_list_end_bit &&
+           equal_rbsp_bits(a->data, 0, b->data, 0, a->scaling_list_start_bit) &&
+           equal_rbsp_bits(a->data, a->scaling_list_end_bit,
+                           b->data, b->scaling_list_end_bit, tail);
+}
+
 static int hevc_frame_start(HEVCContext *s, HEVCLayerContext *l,
                             unsigned nal_idx)
 {
@@ -3216,9 +3257,14 @@ static int hevc_frame_start(HEVCContext *s, HEVCLayerContext *l,
     av_refstruct_replace(&s->pps, pps);
     // Headers can replace an SPS and restore it before a picture uses it.
     // Preserve the active base decoder when the effective SPS is identical.
-    if (l == &s->layers[0] && l->sps && l->sps != sps &&
-        s->vps == sps->vps && ff_hevc_sps_equal(l->sps, sps))
-        av_refstruct_replace(&l->sps, sps);
+    if (l == &s->layers[0] && l->sps && l->sps != sps && s->vps == sps->vps) {
+        // Software and VAAPI read the active scaling matrices for each picture.
+        if (ff_hevc_sps_equal(l->sps, sps) ||
+            (IS_IDR(s) && (s->avctx->pix_fmt == sps->pix_fmt ||
+                           s->avctx->pix_fmt == AV_PIX_FMT_VAAPI) &&
+             sps_equal_except_scaling_list(l->sps, sps)))
+            av_refstruct_replace(&l->sps, sps);
+    }
 
     if (l->sps != sps) {
         const HEVCSPS *sps_base = s->layers[0].sps;
