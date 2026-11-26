@@ -81,6 +81,11 @@ fate-h265-levels: libavcodec/tests/h265_levels$(EXESUF)
 fate-h265-levels: CMD = run libavcodec/tests/h265_levels$(EXESUF)
 fate-h265-levels: REF = /dev/null
 
+FATE_LIBAVCODEC-$(CONFIG_HEVC_DECODER) += fate-hevc-sps-scaling-list
+fate-hevc-sps-scaling-list: libavcodec/tests/hevc_sps$(EXESUF)
+fate-hevc-sps-scaling-list: CMD = run libavcodec/tests/hevc_sps$(EXESUF)
+fate-hevc-sps-scaling-list: REF = /dev/null
+
 FATE_LIBAVCODEC-$(CONFIG_MPEGVIDEO) += fate-mpeg12framerate
 fate-mpeg12framerate: libavcodec/tests/mpeg12framerate$(EXESUF)
 fate-mpeg12framerate: CMD = run libavcodec/tests/mpeg12framerate$(EXESUF)

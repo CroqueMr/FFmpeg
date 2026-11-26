@@ -278,6 +278,7 @@ typedef struct HEVCSPS {
     PTL ptl;
 
     ScalingList scaling_list;
+    int scaling_list_start_bit, scaling_list_end_bit;
 
     unsigned int nb_st_rps;
     ShortTermRPS st_rps[HEVC_MAX_SHORT_TERM_REF_PIC_SETS];
@@ -364,6 +365,7 @@ typedef struct HEVCSPS {
 
     uint8_t *data;
     int data_size;
+    int data_bits;
 
     const HEVCVPS *vps; ///< RefStruct reference
 } HEVCSPS;
